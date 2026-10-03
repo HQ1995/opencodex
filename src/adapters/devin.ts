@@ -10,7 +10,7 @@ import type { AdapterEvent, OcxAssistantMessage, OcxContentPart, OcxMessage, Ocx
 import { namespacedToolName } from "../types";
 import type { IncomingMeta, ProviderAdapter } from "./base";
 import { streamChatEventsWithResetRetry, devinStatedResetWaitMs, allocateCascadeId, CloudChatError, type ChatHistoryItem, type ToolDef } from "./devin/cloud-direct";
-import type { CloudChatEvent, ContentPart } from "./devin/cloud-direct/chat";
+import { devinCacheIdentity, type CloudChatEvent, type ContentPart } from "./devin/cloud-direct/chat";
 import { getCachedCatalog, type CacheEntry, type ModelCatalogEntry } from "./devin/cloud-direct/catalog";
 import { collapseDevinModelUid, devinFamiliesOf, devinFamilyBaseId, selectDevinFamilyMember, type DevinVariantRequest } from "./devin/live-models";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
@@ -656,6 +656,32 @@ export function mapDevinToolCallStartForTests(
   return mapDevinToolCallStart(id, name, buildDevinReturnedToolNameMap(tools));
 }
 
+/**
+ * Cognition routes a CortexTrajectoryReference to the replica that holds its
+ * prompt cache. A conversation the client names keeps one trajectory, which
+ * outlives the request-scoped adapter a proxy builds per HTTP request; an
+ * unnamed turn still mints one per request. A live trajectory is never lent
+ * to an overlapping turn: the server holds or drops concurrent turns on one id.
+ */
+const TRAJECTORY_ID_MAX = 256;
+const trajectoryIds = new Map<string, string>();
+const liveTrajectories = new Set<string>();
+
+function claimTrajectory(apiKey: string, host: string, conversation: string | null | undefined): string | undefined {
+  if (!conversation) return undefined;
+  const key = devinCacheIdentity(apiKey, `${host}\x1f${conversation}`);
+  let id = trajectoryIds.get(key);
+  if (!id) {
+    const oldest = trajectoryIds.size >= TRAJECTORY_ID_MAX ? trajectoryIds.keys().next().value : undefined;
+    if (oldest !== undefined) trajectoryIds.delete(oldest);
+    id = crypto.randomUUID();
+    trajectoryIds.set(key, id);
+  }
+  if (liveTrajectories.has(id)) return undefined;
+  liveTrajectories.add(id);
+  return id;
+}
+
 export function createDevinAdapter(
   provider: OcxProviderConfig,
   context: { providerId?: string } = {},
@@ -744,6 +770,9 @@ export function createDevinAdapter(
       let messages: ChatHistoryItem[] = [];
       let tools: ToolDef[] | undefined;
 
+      const trajectoryId = claimTrajectory(apiKey, host, parsed._clientThreadId
+        || incoming.headers.get("session_id") || incoming.headers.get("x-session-affinity"));
+
       const closeOpenTool = () => {
         if (!openToolId) return;
         emit({ type: "tool_call_end" });
@@ -780,6 +809,7 @@ export function createDevinAdapter(
           messages,
           tools,
           cascadeId,
+          trajectoryId,
           completionOpts: {
             ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
             ...(typeof parsed.options.temperature === "number" ? { temperature: parsed.options.temperature } : {}),
@@ -961,6 +991,8 @@ export function createDevinAdapter(
           ...(error instanceof CloudChatError && error.code ? { code: error.code } : {}),
           ...(usage ? { usage } : {}),
         });
+      } finally {
+        if (trajectoryId) liveTrajectories.delete(trajectoryId);
       }
     },
   };

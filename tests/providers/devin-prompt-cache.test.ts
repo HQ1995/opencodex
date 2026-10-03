@@ -54,6 +54,21 @@ describe("prompt cache options on the wire", () => {
   });
 });
 
+describe("trajectory reference on the wire", () => {
+  function trajectoryOf(buf: Buffer): string {
+    const reference = [...iterFields(buf)].find(field => field.num === 15)!.value as Buffer;
+    return ([...iterFields(reference)].find(field => field.num === 1)!.value as Buffer).toString();
+  }
+
+  test("a supplied trajectory id is sent as #15.1", () => {
+    expect(trajectoryOf(buildRequest({ trajectoryId: "trajectory-1" }))).toBe("trajectory-1");
+  });
+
+  test("without one, every request mints its own", () => {
+    expect(trajectoryOf(buildRequest())).not.toBe(trajectoryOf(buildRequest()));
+  });
+});
+
 describe("devin cache identity", () => {
   test("the raw credential never becomes the cache key", () => {
     const apiKey = "devin-secret-token-value";
@@ -128,6 +143,7 @@ describe("one catalog read serves the cached chat path", () => {
     provider: Partial<OcxProviderConfig> = {},
     options: OcxParsedRequest["options"] = {},
     signal?: AbortSignal,
+    headers = new Headers(),
   ): Promise<AdapterEvent[]> {
     const adapter = createDevinAdapter({ ...provider, adapter: "devin", apiKey, baseUrl: host });
     const events: AdapterEvent[] = [];
@@ -135,7 +151,7 @@ describe("one catalog read serves the cached chat path", () => {
       modelId, stream: true,
       context: { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
       options: { maxOutputTokens: 64, ...options },
-    }, { headers: new Headers(), translatorBudget: createTranslatorBudget(), abortSignal: signal },
+    }, { headers, translatorBudget: createTranslatorBudget(), abortSignal: signal },
     event => { events.push(event); });
     return events;
   }
@@ -224,6 +240,56 @@ describe("one catalog read serves the cached chat path", () => {
     const events = await run();
     expect(events.some(event => event.type === "error")).toBe(true);
     expect(requests).toHaveLength(0);
+  });
+
+  function sentTrajectories(): string[] {
+    return requests.map(request => {
+      const reference = fields(request).get(15)!.value as Buffer;
+      return (fields(reference).get(1)!.value as Buffer).toString();
+    });
+  }
+  const conversation = (id: string) => new Headers({ session_id: id });
+
+  test("a named conversation keeps one trajectory across request-scoped adapters", async () => {
+    // Cognition routes a trajectory to the replica holding its prompt cache; a
+    // proxy builds a fresh adapter for every HTTP request.
+    seed([{ uid: "swe-2-high", window: 262_000 }]);
+    await run("swe-2-high", {}, {}, undefined, conversation("conversation-a"));
+    await run("swe-2-high", {}, {}, undefined, new Headers({ "x-session-affinity": "conversation-a" }));
+    await run("swe-2-high", {}, {}, undefined, conversation("conversation-b"));
+    const [first, second, other] = sentTrajectories();
+    expect(second).toBe(first);
+    expect(other).not.toBe(first);
+  });
+
+  test("unnamed turns still mint a trajectory per request", async () => {
+    seed([{ uid: "swe-2-high", window: 262_000 }]);
+    await run();
+    await run();
+    const [first, second] = sentTrajectories();
+    expect(second).not.toBe(first);
+  });
+
+  test("an overlapping turn never shares the live trajectory of its conversation", async () => {
+    seed([{ uid: "swe-2-high", window: 262_000 }]);
+    const recorded = globalThis.fetch;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await recorded(input, init);
+      if (String(input).endsWith("/GetChatMessage") && requests.length === 1) await held;
+      return response;
+    }) as typeof fetch;
+    const first = run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
+    while (requests.length < 1) await Bun.sleep(1);
+    await run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
+    release();
+    await first;
+    await run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
+    const [live, overlapping, later] = sentTrajectories();
+    expect(overlapping).not.toBe(live);
+    // Released once the turn ends, so the conversation keeps its trajectory.
+    expect(later).toBe(live);
   });
 
   test("an already cancelled turn never fetches metadata or sends inference", async () => {
