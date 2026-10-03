@@ -274,22 +274,52 @@ describe("one catalog read serves the cached chat path", () => {
     seed([{ uid: "swe-2-high", window: 262_000 }]);
     const recorded = globalThis.fetch;
     let release!: () => void;
+    let sent!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
+    const firstSent = new Promise<"sent">(resolve => { sent = () => resolve("sent"); });
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const response = await recorded(input, init);
-      if (String(input).endsWith("/GetChatMessage") && requests.length === 1) await held;
+      if (String(input).endsWith("/GetChatMessage") && requests.length === 1) {
+        sent();
+        await held;
+      }
       return response;
     }) as typeof fetch;
     const first = run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
-    while (requests.length < 1) await Bun.sleep(1);
-    await run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
-    release();
+    try {
+      // A first turn that ends without sending would otherwise leave this test waiting.
+      const ended = first.then(() => "ended" as const, () => "ended" as const);
+      expect(await Promise.race([firstSent, ended])).toBe("sent");
+      await run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
+    } finally {
+      release();
+    }
     await first;
     await run("swe-2-high", {}, {}, undefined, conversation("conversation-c"));
     const [live, overlapping, later] = sentTrajectories();
     expect(overlapping).not.toBe(live);
     // Released once the turn ends, so the conversation keeps its trajectory.
     expect(later).toBe(live);
+  });
+
+  test("a failed turn still releases its conversation's trajectory", async () => {
+    seed([{ uid: "swe-2-high", window: 262_000 }]);
+    const recorded = globalThis.fetch;
+    let failed = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await recorded(input, init);
+      if (!failed && String(input).endsWith("/GetChatMessage")) {
+        failed = true;
+        return new Response("rejected", { status: 400 });
+      }
+      return response;
+    }) as typeof fetch;
+    const failedTurn = await run("swe-2-high", {}, {}, undefined, conversation("conversation-d"));
+    expect(failedTurn.some(event => event.type === "error")).toBe(true);
+    const nextTurn = await run("swe-2-high", {}, {}, undefined, conversation("conversation-d"));
+    expect(nextTurn.some(event => event.type === "error")).toBe(false);
+    const trajectories = sentTrajectories();
+    expect(trajectories.at(-1)).toBe(trajectories[0]);
   });
 
   test("an already cancelled turn never fetches metadata or sends inference", async () => {
